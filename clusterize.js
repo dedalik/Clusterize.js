@@ -1,6 +1,6 @@
-/*! Clusterize.js - v0.7.0 - 2015-05-21
+/*! Clusterize.js - v0.17.6 - 2017-03-05
 * http://NeXTs.github.com/Clusterize.js/
-* Copyright (c) 2015 Denis Lukov; Licensed MIT */
+* Copyright (c) 2015 Denis Lukov; Licensed GPLv3 */
 
 ;(function(name, definition) {
     if (typeof module != 'undefined') module.exports = definition();
@@ -19,32 +19,27 @@
          all[0];
        ){}
     return v > 4 ? v : document.documentMode;
-  }());
-
+  }()),
+  is_mac = navigator.platform.toLowerCase().indexOf('mac') + 1;
   var Clusterize = function(data) {
     if( ! (this instanceof Clusterize))
       return new Clusterize(data);
     var self = this;
 
     var defaults = {
-      item_height: 0,
-      block_height: 0,
       rows_in_block: 50,
-      rows_in_cluster: 0,
-      cluster_height: 0,
       blocks_in_cluster: 4,
       tag: null,
-      content_tag: null,
       show_no_data_row: true,
       no_data_class: 'clusterize-no-data',
       no_data_text: 'No data',
       keep_parity: true,
-      verify_change: false
+      callbacks: {}
     }
 
     // public parameters
     self.options = {};
-    var options = ['rows_in_block', 'blocks_in_cluster', 'verify_change', 'show_no_data_row', 'no_data_class', 'no_data_text', 'keep_parity', 'tag'];
+    var options = ['rows_in_block', 'blocks_in_cluster', 'show_no_data_row', 'no_data_class', 'no_data_text', 'keep_parity', 'tag', 'callbacks'];
     for(var i = 0, option; option = options[i]; i++) {
       self.options[option] = typeof data[option] != 'undefined' && data[option] != null
         ? data[option]
@@ -60,15 +55,16 @@
         throw new Error("Error! Could not find " + elem + " element");
     }
 
+    // tabindex forces the browser to keep focus on the scrolling list, fixes #11
+    if( ! self.content_elem.hasAttribute('tabindex'))
+      self.content_elem.setAttribute('tabindex', 0);
+
     // private parameters
     var rows = isArray(data.rows)
         ? data.rows
         : self.fetchMarkup(),
-      cache = {data: ''},
+      cache = {},
       scroll_top = self.scroll_elem.scrollTop;
-
-    // get row height
-    self.exploreEnvironment(rows);
 
     // append initial data
     self.insertToDOM(rows, cache);
@@ -78,22 +74,51 @@
 
     // adding scroll handler
     var last_cluster = false,
-    scrollEv = function () {
+    scroll_debounce = 0,
+    pointer_events_set = false,
+    scrollEv = function() {
+      // fixes scrolling issue on Mac #3
+      if (is_mac) {
+          if( ! pointer_events_set) self.content_elem.style.pointerEvents = 'none';
+          pointer_events_set = true;
+          clearTimeout(scroll_debounce);
+          scroll_debounce = setTimeout(function () {
+              self.content_elem.style.pointerEvents = 'auto';
+              pointer_events_set = false;
+          }, 50);
+      }
       if (last_cluster != (last_cluster = self.getClusterNum()))
         self.insertToDOM(rows, cache);
+      if (self.options.callbacks.scrollingProgress)
+        self.options.callbacks.scrollingProgress(self.getScrollProgress());
+    },
+    resize_debounce = 0,
+    resizeEv = function() {
+      clearTimeout(resize_debounce);
+      resize_debounce = setTimeout(self.refresh, 100);
     }
     on('scroll', self.scroll_elem, scrollEv);
+    on('resize', window, resizeEv);
 
     // public methods
     self.destroy = function(clean) {
       off('scroll', self.scroll_elem, scrollEv);
+      off('resize', window, resizeEv);
       self.html((clean ? self.generateEmptyRow() : rows).join(''));
+    }
+    self.refresh = function(force) {
+      if(self.getRowsHeight(rows) || force) self.update(rows);
     }
     self.update = function(new_rows) {
       rows = isArray(new_rows)
         ? new_rows
         : [];
       var scroll_top = self.scroll_elem.scrollTop;
+      // fixes #39
+      if(rows.length * self.options.item_height < scroll_top) {
+        self.scroll_elem.scrollTop = 0;
+        last_cluster = 0;
+      }
       self.insertToDOM(rows, cache);
       self.scroll_elem.scrollTop = scroll_top;
     }
@@ -103,6 +128,10 @@
     self.getRowsAmount = function() {
       return rows.length;
     }
+    self.getScrollProgress = function() {
+      return this.options.scroll_top / (rows.length * this.options.item_height) * 100 || 0;
+    }
+
     var add = function(where, _new_rows) {
       var new_rows = isArray(_new_rows)
         ? _new_rows
@@ -132,25 +161,41 @@
       return rows;
     },
     // get tag name, content tag name, tag height, calc cluster height
-    exploreEnvironment: function(rows) {
+    exploreEnvironment: function(rows, cache) {
       var opts = this.options;
       opts.content_tag = this.content_elem.tagName.toLowerCase();
-      if( ! opts.item_height || ! opts.tag) {
-        if( ! rows.length) return;
-        if(ie && ie <= 9) opts.tag = rows[0].split('<')[1].split(' ')[0].split('>')[0];
-        this.html(rows[0] + rows[0] + rows[0]);
-        var node = this.content_elem.children[1];
-        if( ! opts.tag) opts.tag = node.tagName.toLowerCase();
-        opts.item_height = node.offsetHeight;
+      if( ! rows.length) return;
+      if(ie && ie <= 9 && ! opts.tag) opts.tag = rows[0].match(/<([^>\s/]*)/)[1].toLowerCase();
+      if(this.content_elem.children.length <= 1) cache.data = this.html(rows[0] + rows[0] + rows[0]);
+      if( ! opts.tag) opts.tag = this.content_elem.children[0].tagName.toLowerCase();
+      this.getRowsHeight(rows);
+    },
+    getRowsHeight: function(rows) {
+      var opts = this.options,
+        prev_item_height = opts.item_height;
+      opts.cluster_height = 0;
+      if( ! rows.length) return;
+      var nodes = this.content_elem.children;
+      var node = nodes[Math.floor(nodes.length / 2)];
+      opts.item_height = node.offsetHeight;
+      // consider table's border-spacing
+      if(opts.tag == 'tr' && getStyle('borderCollapse', this.content_elem) != 'collapse')
+        opts.item_height += parseInt(getStyle('borderSpacing', this.content_elem), 10) || 0;
+      // consider margins (and margins collapsing)
+      if(opts.tag != 'tr') {
+        var marginTop = parseInt(getStyle('marginTop', node), 10) || 0;
+        var marginBottom = parseInt(getStyle('marginBottom', node), 10) || 0;
+        opts.item_height += Math.max(marginTop, marginBottom);
       }
       opts.block_height = opts.item_height * opts.rows_in_block;
       opts.rows_in_cluster = opts.blocks_in_cluster * opts.rows_in_block;
       opts.cluster_height = opts.blocks_in_cluster * opts.block_height;
+      return prev_item_height != opts.item_height;
     },
     // get current cluster number
     getClusterNum: function () {
-      var opts = this.options;
-      return Math.floor(this.scroll_elem.scrollTop / (opts.cluster_height - opts.block_height));
+      this.options.scroll_top = this.scroll_elem.scrollTop;
+      return Math.floor(this.options.scroll_top / (this.options.cluster_height - this.options.block_height)) || 0;
     },
     // generate empty row if no data provided
     generateEmptyRow: function() {
@@ -161,6 +206,8 @@
       empty_row.className = opts.no_data_class;
       if(opts.tag == 'tr') {
         td = document.createElement('td');
+        // fixes #53
+        td.colSpan = 100;
         td.appendChild(no_data_content);
       }
       empty_row.appendChild(td || no_data_content);
@@ -172,31 +219,27 @@
         rows_len = rows.length;
       if (rows_len < opts.rows_in_block) {
         return {
+          top_offset: 0,
+          bottom_offset: 0,
           rows_above: 0,
           rows: rows_len ? rows : this.generateEmptyRow()
         }
       }
-      if( ! opts.cluster_height) {
-        this.exploreEnvironment(rows);
-      }
-      var items_start = cluster_num * opts.rows_in_cluster - opts.rows_in_block * cluster_num,
-        items_start = items_start > 0 ? items_start : 0,
+      var items_start = Math.max((opts.rows_in_cluster - opts.rows_in_block) * cluster_num, 0),
         items_end = items_start + opts.rows_in_cluster,
-        top_space = items_start * opts.item_height,
-        bottom_space = (rows_len - items_end) * opts.item_height,
+        top_offset = Math.max(items_start * opts.item_height, 0),
+        bottom_offset = Math.max((rows_len - items_end) * opts.item_height, 0),
         this_cluster_rows = [],
         rows_above = items_start;
-      if(top_space > 0) {
-        opts.keep_parity && this_cluster_rows.push(this.renderExtraTag('keep-parity'));
-        this_cluster_rows.push(this.renderExtraTag('top-space', top_space));
-      } else {
+      if(top_offset < 1) {
         rows_above++;
       }
       for (var i = items_start; i < items_end; i++) {
         rows[i] && this_cluster_rows.push(rows[i]);
       }
-      bottom_space > 0 && this_cluster_rows.push(this.renderExtraTag('bottom-space', bottom_space));
       return {
+        top_offset: top_offset,
+        bottom_offset: bottom_offset,
         rows_above: rows_above,
         rows: this_cluster_rows
       }
@@ -210,11 +253,31 @@
     },
     // if necessary verify data changed and insert to DOM
     insertToDOM: function(rows, cache) {
+      // explore row's height
+      if( ! this.options.cluster_height) {
+        this.exploreEnvironment(rows, cache);
+      }
       var data = this.generate(rows, this.getClusterNum()),
-        outer_data = data.rows.join('');
-      if( ! this.options.verify_change || this.options.verify_change && this.dataChanged(outer_data, cache)) {
-        this.html(outer_data);
+        this_cluster_rows = data.rows.join(''),
+        this_cluster_content_changed = this.checkChanges('data', this_cluster_rows, cache),
+        top_offset_changed = this.checkChanges('top', data.top_offset, cache),
+        only_bottom_offset_changed = this.checkChanges('bottom', data.bottom_offset, cache),
+        callbacks = this.options.callbacks,
+        layout = [];
+
+      if(this_cluster_content_changed || top_offset_changed) {
+        if(data.top_offset) {
+          this.options.keep_parity && layout.push(this.renderExtraTag('keep-parity'));
+          layout.push(this.renderExtraTag('top-space', data.top_offset));
+        }
+        layout.push(this_cluster_rows);
+        data.bottom_offset && layout.push(this.renderExtraTag('bottom-space', data.bottom_offset));
+        callbacks.clusterWillChange && callbacks.clusterWillChange();
+        this.html(layout.join(''));
         this.options.content_tag == 'ol' && this.content_elem.setAttribute('start', data.rows_above);
+        callbacks.clusterChanged && callbacks.clusterChanged();
+      } else if(only_bottom_offset_changed) {
+        this.content_elem.lastChild.style.height = data.bottom_offset + 'px';
       }
     },
     // unfortunately ie <= 9 does not allow to use innerHTML for table elements, so make a workaround
@@ -222,9 +285,9 @@
       var content_elem = this.content_elem;
       if(ie && ie <= 9 && this.options.tag == 'tr') {
         var div = document.createElement('div'), last;
-        div.innerHTML = '<table><tbody>' + data + '</tbody></table>'
+        div.innerHTML = '<table><tbody>' + data + '</tbody></table>';
         while((last = content_elem.lastChild)) {
-          content_elem.removeChild(last)
+          content_elem.removeChild(last);
         }
         var rows_nodes = this.getChildNodes(div.firstChild.firstChild);
         while (rows_nodes.length) {
@@ -235,17 +298,16 @@
       }
     },
     getChildNodes: function(tag) {
-      var child_nodes = tag.children,
-          ie8_child_nodes_helper = [];
+        var child_nodes = tag.children, nodes = [];
         for (var i = 0, ii = child_nodes.length; i < ii; i++) {
-          ie8_child_nodes_helper.push(child_nodes[i]);
+            nodes.push(child_nodes[i]);
         }
-        return Array.prototype.slice.call(ie8_child_nodes_helper);
+        return nodes;
     },
-    dataChanged: function(data, cache) {
-      var current_data = JSON.stringify(data),
-        changed = current_data !== cache.data;
-      return changed && (cache.data = current_data);
+    checkChanges: function(type, value, cache) {
+      var changed = value != cache[type];
+      cache[type] = value;
+      return changed;
     }
   }
 
@@ -258,6 +320,9 @@
   }
   function isArray(arr) {
     return Object.prototype.toString.call(arr) === '[object Array]';
+  }
+  function getStyle(prop, elem) {
+    return window.getComputedStyle ? window.getComputedStyle(elem)[prop] : elem.currentStyle[prop];
   }
 
   return Clusterize;
